@@ -1,5 +1,6 @@
 #include <condition_variable>
 #include <functional>
+#include <future>
 #include <iostream>
 #include <memory> // 添加头文件
 #include <mutex>
@@ -16,7 +17,7 @@ class SubInterpreterPool {
 public:
   SubInterpreterPool(int num_interpreters)
       : num_interpreters_(num_interpreters) {
-    
+
     interpreters_.reserve(num_interpreters);
     threads_.reserve(num_interpreters_);
 
@@ -42,6 +43,24 @@ public:
     std::lock_guard<std::mutex> lock(queue_mutex_);
     task_queue_.push(func);
     cv_.notify_one();
+  }
+
+  // 提交一组 Python 表达式，返回 future 列表用于等待
+  std::vector<std::future<void>>
+  submit_batch(const std::vector<std::string> &expressions) {
+    std::vector<std::future<void>> futures;
+    std::lock_guard<std::mutex> lock(queue_mutex_);
+
+    for (const auto &code : expressions) {
+      auto task = std::make_shared<std::packaged_task<void()>>(
+          [code]() { py::exec(code.c_str()); });
+
+      futures.emplace_back(task->get_future());
+      task_queue_.push([task]() { (*task)(); });
+    }
+
+    cv_.notify_all();
+    return futures;
   }
 
 private:
@@ -97,10 +116,26 @@ int main() {
 
   SubInterpreterPool pool(4);
 
-  pool.submit([] { run_python_code("print('Hello from subinterpreter 1')"); });
-  pool.submit([] { call_python_function(); });
-  pool.submit([] { run_python_code("x = 5 + 3; print(x)"); });
-  pool.submit([] { run_python_code("for i in range(3): print(i)"); });
+  // pool.submit([] { run_python_code("print('Hello from subinterpreter 1')"); });
+  // pool.submit([] { call_python_function(); });
+  // pool.submit([] { run_python_code("x = 5 + 3; print(x)"); });
+  // pool.submit([] { run_python_code("for i in range(3): print(i)"); });
 
+  std::vector<std::string> tasks = {
+      "print('Task 1 in sub-interpreter')",
+      "print('Task 2 in sub-interpreter')",
+      "x = 100 + 200\nprint(f'x = {x}')",
+      "for i in range(3): print(f'Loop: {i}')",
+  };
+
+  std::cout << "Submitting batch..." << std::endl;
+  auto futures = pool.submit_batch(tasks);
+
+  std::cout << "Waiting for all tasks to complete..." << std::endl;
+  for (auto &f : futures) {
+    f.wait(); // 或者使用 f.get() 等待并捕获异常
+  }
+
+  std::cout << "All tasks completed." << std::endl;
   return 0;
 }
