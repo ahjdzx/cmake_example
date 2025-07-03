@@ -27,6 +27,7 @@ PYBIND11_EMBEDDED_MODULE(printer, m,
  * 参考: https://pybind11.readthedocs.io/en/latest/advanced/embedding.html#full-sub-interpreter-example
  */
 int main() {
+  // 创建主Python解释器环境
   py::scoped_interpreter main_interp;
 
   py::module_::import("printer").attr("which")("First init");

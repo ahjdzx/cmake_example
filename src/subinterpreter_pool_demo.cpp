@@ -12,12 +12,14 @@
 
 namespace py = pybind11;
 
-// void init_python() { py::initialize_interpreter(); }
-
 class SubInterpreterPool {
 public:
   SubInterpreterPool(int num_interpreters)
       : num_interpreters_(num_interpreters) {
+    
+    interpreters_.reserve(num_interpreters);
+    threads_.reserve(num_interpreters_);
+
     for (int i = 0; i < num_interpreters_; ++i) {
       // 使用unique_ptr管理subinterpreter
       interpreters_.emplace_back(
@@ -33,8 +35,7 @@ public:
     for (auto &thread : threads_) {
       thread.join();
     }
-    // py::finalize_interpreter();
-    interpreters_.clear(); // Explicitly clear subinterpreters first
+    interpreters_.clear();
   }
 
   template <typename F> void submit(F func) {
@@ -92,10 +93,8 @@ void call_python_function() {
 }
 
 int main() {
-  //   init_python();
-
   py::scoped_interpreter guard{}; // Manages main interpreter lifecycle
-  
+
   SubInterpreterPool pool(4);
 
   pool.submit([] { run_python_code("print('Hello from subinterpreter 1')"); });
