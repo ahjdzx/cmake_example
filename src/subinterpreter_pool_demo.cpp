@@ -63,6 +63,26 @@ public:
     return futures;
   }
 
+  // 分批提交 Python 表达式，并返回每个表达式的结果 future 列表
+  std::vector<std::future<py::object>>
+  submit_batch2(const std::vector<std::string> &expressions) {
+    std::vector<std::future<py::object>> futures;
+    std::lock_guard<std::mutex> lock(queue_mutex_);
+
+    for (const auto &code : expressions) {
+      auto task = std::make_shared<std::packaged_task<py::object()>>(
+          [code]() -> py::object {
+            return py::eval(code.c_str()); // 使用 eval 获取返回值
+          });
+
+      futures.emplace_back(task->get_future());
+      task_queue_.push([task]() { (*task)(); });
+    }
+
+    cv_.notify_all();
+    return futures;
+  }
+
 private:
   void worker_thread(py::subinterpreter *sub) {
     while (true) {
@@ -111,15 +131,17 @@ void call_python_function() {
   }
 }
 
-int main() {
-  py::scoped_interpreter guard{}; // Manages main interpreter lifecycle
-
+void test1() {
   SubInterpreterPool pool(4);
 
-  // pool.submit([] { run_python_code("print('Hello from subinterpreter 1')"); });
-  // pool.submit([] { call_python_function(); });
-  // pool.submit([] { run_python_code("x = 5 + 3; print(x)"); });
-  // pool.submit([] { run_python_code("for i in range(3): print(i)"); });
+  pool.submit([] { run_python_code("print('Hello from subinterpreter 1')"); });
+  pool.submit([] { call_python_function(); });
+  pool.submit([] { run_python_code("x = 5 + 3; print(x)"); });
+  pool.submit([] { run_python_code("for i in range(3): print(i)"); });
+}
+
+void test2() {
+  SubInterpreterPool pool(4);
 
   std::vector<std::string> tasks = {
       "print('Task 1 in sub-interpreter')",
@@ -137,5 +159,43 @@ int main() {
   }
 
   std::cout << "All tasks completed." << std::endl;
+}
+
+void test3() {
+  SubInterpreterPool pool(4);
+
+  std::vector<std::string> tasks = {
+      "2 + 3",
+      "5 * 7",
+      "sum([1, 2, 3])",
+      "'hello' + 'world'",
+  };
+
+  std::cout << "Submitting batch..." << std::endl;
+  auto futures = pool.submit_batch2(tasks);
+
+  std::cout << "Waiting for results..." << std::endl;
+  for (size_t i = 0; i < futures.size(); ++i) {
+    try {
+      py::object result = futures[i].get();
+      std::string result_str = py::str(result).cast<std::string>();
+      std::cout << "Result[" << i << "] = " << result_str << std::endl;
+    } catch (const py::error_already_set &e) {
+      std::cerr << "Python error in task " << i << ": " << e.what()
+                << std::endl;
+    } catch (const std::exception &e) {
+      std::cerr << "C++ error in task " << i << ": " << e.what() << std::endl;
+    }
+  }
+
+  std::cout << "All tasks completed." << std::endl;
+}
+
+int main() {
+  py::scoped_interpreter guard{}; // Manages main interpreter lifecycle
+
+  test1();
+  test2();
+  test3();
   return 0;
 }
