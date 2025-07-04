@@ -1,3 +1,4 @@
+#include "pybind11/pytypes.h"
 #include <condition_variable>
 #include <functional>
 #include <future>
@@ -18,12 +19,9 @@ public:
   SubInterpreterPool(int num_interpreters)
       : num_interpreters_(num_interpreters) {
 
-    interpreters_.reserve(num_interpreters);
-    threads_.reserve(num_interpreters_);
-
     for (int i = 0; i < num_interpreters_; ++i) {
       // 使用unique_ptr管理subinterpreter
-      interpreters_.emplace_back(
+      interpreters_.push_back(
           std::make_unique<py::subinterpreter>(py::subinterpreter::create()));
       threads_.emplace_back(&SubInterpreterPool::worker_thread, this,
                             interpreters_.back().get());
@@ -64,23 +62,41 @@ public:
   }
 
   // 分批提交 Python 表达式，并返回每个表达式的结果 future 列表
-  std::vector<std::future<py::object>>
+  std::vector<py::object>
   submit_batch2(const std::vector<std::string> &expressions) {
+
     std::vector<std::future<py::object>> futures;
-    std::lock_guard<std::mutex> lock(queue_mutex_);
 
     for (const auto &code : expressions) {
       auto task = std::make_shared<std::packaged_task<py::object()>>(
           [code]() -> py::object {
-            return py::eval(code.c_str()); // 使用 eval 获取返回值
+            py::gil_scoped_acquire acquire;
+            py::dict l1;
+            l1["a"] = 5;
+            l1["b"] = 3;
+            l1["x"] = 10;
+            l1["y"] = 20;
+            return py::eval(code.c_str(), py::globals(), l1); // 使用 eval 获取返回值
           });
 
-      futures.emplace_back(task->get_future());
-      task_queue_.push([task]() { (*task)(); });
+      futures.push_back(task->get_future());
+      submit([task]() { (*task)(); });
     }
 
-    cv_.notify_all();
-    return futures;
+    std::vector<py::object> results;
+    for (auto &future : futures) {
+      try {
+        py::gil_scoped_acquire acquire;
+        results.push_back(future.get());
+      } catch (const std::future_error &e) {
+        std::cerr << "Future error: " << e.what() << std::endl;
+        results.push_back(py::none());
+      } catch (const py::error_already_set &e) {
+        std::cerr << "Python error: " << e.what() << std::endl;
+        results.push_back(py::none());
+      }
+    }
+    return results;
   }
 
 private:
@@ -109,8 +125,7 @@ private:
   }
 
   int num_interpreters_;
-  std::vector<std::unique_ptr<py::subinterpreter>>
-      interpreters_; // 改为存储unique_ptr
+  std::vector<std::unique_ptr<py::subinterpreter>> interpreters_;
   std::vector<std::thread> threads_;
   std::queue<std::function<void()>> task_queue_;
   std::mutex queue_mutex_;
@@ -131,8 +146,7 @@ void call_python_function() {
   }
 }
 
-void test1() {
-  SubInterpreterPool pool(4);
+void test1(SubInterpreterPool &pool) {
 
   pool.submit([] { run_python_code("print('Hello from subinterpreter 1')"); });
   pool.submit([] { call_python_function(); });
@@ -140,8 +154,7 @@ void test1() {
   pool.submit([] { run_python_code("for i in range(3): print(i)"); });
 }
 
-void test2() {
-  SubInterpreterPool pool(4);
+void test2(SubInterpreterPool &pool) {
 
   std::vector<std::string> tasks = {
       "print('Task 1 in sub-interpreter')",
@@ -161,23 +174,19 @@ void test2() {
   std::cout << "All tasks completed." << std::endl;
 }
 
-void test3() {
-  SubInterpreterPool pool(4);
+void test3(SubInterpreterPool &pool) {
 
   std::vector<std::string> tasks = {
-      "2 + 3",
-      "5 * 7",
-      "sum([1, 2, 3])",
-      "'hello' + 'world'",
+      "2 + 3", "5 * 7", "sum([1, 2, 3])", "'hello' + 'world'", "a + b",
   };
 
   std::cout << "Submitting batch..." << std::endl;
-  auto futures = pool.submit_batch2(tasks);
+  auto results = pool.submit_batch2(tasks);
 
   std::cout << "Waiting for results..." << std::endl;
-  for (size_t i = 0; i < futures.size(); ++i) {
+  for (size_t i = 0; i < results.size(); ++i) {
     try {
-      py::object result = futures[i].get();
+      py::object result = results[i];
       std::string result_str = py::str(result).cast<std::string>();
       std::cout << "Result[" << i << "] = " << result_str << std::endl;
     } catch (const py::error_already_set &e) {
@@ -194,8 +203,10 @@ void test3() {
 int main() {
   py::scoped_interpreter guard{}; // Manages main interpreter lifecycle
 
-  test1();
-  test2();
-  test3();
+  SubInterpreterPool pool(4);
+
+  test1(pool);
+  test2(pool);
+  test3(pool);
   return 0;
 }

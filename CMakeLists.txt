@@ -121,3 +121,19 @@ target_link_libraries(subinterpreter_pool_demo
     PRIVATE
     ${Python_LIBRARIES} # 使用新的 FindPython 模块设置的变量
 )
+
+# 添加一个可执行目标
+add_executable(subinterpreter_pool_demo_2 src/subinterpreter_pool_demo_2.cpp)
+
+# 为可执行目标添加 Python 头文件目录
+target_include_directories(subinterpreter_pool_demo_2
+    PRIVATE
+    ${Python_INCLUDE_DIRS}
+    pybind11/include # 使用新的 FindPython 模块设置的变量 # 使用新的 FindPython 模块设置的变量
+)
+
+# 将 Python 库链接到可执行目标
+target_link_libraries(subinterpreter_pool_demo_2
+    PRIVATE
+    ${Python_LIBRARIES} # 使用新的 FindPython 模块设置的变量
+)
