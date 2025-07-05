@@ -11,6 +11,7 @@
 #include <pybind11/subinterpreter.h>
 #include <queue>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace py = pybind11;
@@ -22,9 +23,8 @@ void init_python() { py::initialize_interpreter(); }
 class BatchTask {
 public:
   std::string code;
-  // py::dict global_vars;
-  // py::dict local_vars;
-  std::promise<py::object> result_promise;
+  std::unordered_map<std::string, int> local_ints; // 使用基本类型存储变量
+  std::promise<std::string> result_promise;        // 返回字符串结果
 };
 
 class SubInterpreterPool {
@@ -45,60 +45,52 @@ public:
     for (auto &thread : threads_) {
       thread.join();
     }
-    // py::finalize_interpreter();
   }
 
-  // 提交任务到子解释器（带 globals 和 locals）
   template <typename F> void submit(F func) {
     std::lock_guard<std::mutex> lock(queue_mutex_);
     task_queue_.push(func);
     cv_.notify_one();
   }
 
-  std::vector<py::object>
-  batch_run_python_code_with_context(const std::vector<std::string> &tasks,
-                                     SubInterpreterPool &pool) {
-
-    std::vector<std::future<py::object>> futures;
+  std::vector<std::string> batch_run_python_code_with_context(
+      const std::vector<std::string> &tasks,
+      const std::unordered_map<std::string, int> &shared_locals) {
+    std::vector<std::future<std::string>> futures;
 
     for (const auto &t : tasks) {
       auto bt = std::make_shared<BatchTask>();
       bt->code = t;
+      bt->local_ints = shared_locals; // 复制基本类型数据
       futures.push_back(bt->result_promise.get_future());
 
-      submit([bt]() { // 现在lambda是可复制的
-        py::gil_scoped_acquire acquire;
+      submit([bt]() {
         try {
-          py::dict l1;
-          l1["a"] = 5;
-          l1["b"] = 3;
-          l1["x"] = 10;
-          l1["y"] = 20;
-          py::object result = py::eval(bt->code.c_str(), py::globals(), l1);
-          bt->result_promise.set_value(result);
+          // 在子解释器内创建局部变量
+          py::dict locals;
+          for (const auto &kv : bt->local_ints) {
+            locals[kv.first.c_str()] = kv.second;
+          }
+
+          // 执行Python代码
+          py::object result = py::eval(bt->code.c_str(), py::globals(), locals);
+
+          // 将结果转为字符串（避免跨解释器对象）
+          bt->result_promise.set_value(py::str(result).cast<std::string>());
         } catch (pybind11::error_already_set &e) {
-          std::cerr << "Error in evaluating expression: " << e.what()
-                    << std::endl;
-          bt->result_promise.set_exception(std::current_exception());
+          std::cerr << "Python error: " << e.what() << std::endl;
+          bt->result_promise.set_value("ERROR: " + std::string(e.what()));
         } catch (const std::exception &e) {
-          std::cerr << e.what() << std::endl;
-          bt->result_promise.set_exception(std::current_exception());
+          std::cerr << "System error: " << e.what() << std::endl;
+          bt->result_promise.set_value("ERROR: " + std::string(e.what()));
         }
       });
     }
 
-    std::vector<py::object> results;
+    std::vector<std::string> results;
     for (auto &future : futures) {
-      try {
-        py::gil_scoped_acquire acquire;
-        results.push_back(future.get());
-      } catch (const std::exception &e) {
-        std::cerr << "Error in evaluating expression: " << e.what()
-                  << std::endl;
-        results.push_back(py::none()); // 插入 None 作为错误占位符
-      }
+      results.push_back(future.get());
     }
-
     return results;
   }
 
@@ -117,12 +109,12 @@ private:
 
       // 激活子解释器并执行任务
       {
-        // py::gil_scoped_release release; // 释放主线程的GIL
         py::subinterpreter_scoped_activate activate(*sub);
+        py::gil_scoped_acquire acquire; // 确保获取GIL
         try {
           task();
         } catch (const std::exception &e) {
-          std::cerr << "Python error: " << e.what() << std::endl;
+          std::cerr << "Task execution error: " << e.what() << std::endl;
         }
       }
     }
@@ -137,43 +129,35 @@ private:
   bool stop_ = false;
 };
 
-// 示例：调用Python函数
-void call_python_function() {
-  py::object module = py::module_::import("math");
-  py::object result = module.attr("sqrt")(16.0);
-  std::cout << "Result: " << std::endl;
-  py::print(result);
-}
-
 int main() {
   init_python();
 
-  // 创建子解释器池（假设使用4个子解释器）
+  // 创建子解释器池
   SubInterpreterPool pool(4);
 
   // 构建批量任务
-  std::vector<std::string> tasks;
+  std::vector<std::string> tasks = {
+      "'Hello ' + 'World'", // 任务1: 字符串操作
+      "a + b",              // 任务2: 使用变量a,b
+      "x * y",              // 任务3: 使用变量x,y
+      "3 ** 2 + 4 ** 2"     // 任务4: 数学运算
+  };
 
-  tasks.emplace_back("'Hello ' + 'World'");
-
-  tasks.emplace_back("a + b");
-
-  tasks.emplace_back("x * y");
-
-  tasks.emplace_back("3 ** 2 + 4 ** 2");
+  // 使用基本类型存储变量
+  std::unordered_map<std::string, int> shared_locals = {
+      {"a", 5},
+      {"b", 3},
+      {"x", 10},
+      {"y", 20},
+  };
 
   // 批量执行
-  std::vector<py::object> results =
-      pool.batch_run_python_code_with_context(tasks, pool);
+  std::vector<std::string> results =
+      pool.batch_run_python_code_with_context(tasks, shared_locals);
 
   // 输出结果
   for (size_t i = 0; i < results.size(); ++i) {
-    if (results[i].is_none()) {
-      std::cout << "Task " << i << ": Error or no result" << std::endl;
-    } else {
-      std::cout << "Task " << i << " result: " << std::endl;
-      py::print(results[i]);
-    }
+    std::cout << "Task " << i << " result: " << results[i] << std::endl;
   }
 
   return 0;
