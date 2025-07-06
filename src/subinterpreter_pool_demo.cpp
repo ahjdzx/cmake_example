@@ -3,12 +3,15 @@
 #include <functional>
 #include <future>
 #include <iostream>
-#include <memory> // 添加头文件
+#include <memory>
 #include <mutex>
+#include <pybind11/detail/common.h>
 #include <pybind11/embed.h>
 #include <pybind11/pybind11.h>
+#include <pybind11/pytypes.h>
 #include <pybind11/subinterpreter.h>
 #include <queue>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -43,40 +46,17 @@ public:
     cv_.notify_one();
   }
 
-  // 提交一组 Python 表达式，返回 future 列表用于等待
-  std::vector<std::future<void>>
-  submit_batch(const std::vector<std::string> &expressions) {
-    std::vector<std::future<void>> futures;
-    std::lock_guard<std::mutex> lock(queue_mutex_);
-
-    for (const auto &code : expressions) {
-      auto task = std::make_shared<std::packaged_task<void()>>(
-          [code]() { py::exec(code.c_str()); });
-
-      futures.emplace_back(task->get_future());
-      task_queue_.push([task]() { (*task)(); });
-    }
-
-    cv_.notify_all();
-    return futures;
-  }
-
   // 分批提交 Python 表达式，并返回每个表达式的结果 future 列表
   std::vector<py::object>
-  submit_batch2(const std::vector<std::string> &expressions) {
+  submit_batch(const std::vector<std::string> &expressions, py::dict locals) {
 
     std::vector<std::future<py::object>> futures;
 
     for (const auto &code : expressions) {
       auto task = std::make_shared<std::packaged_task<py::object()>>(
-          [code]() -> py::object {
-            py::gil_scoped_acquire acquire;
-            py::dict l1;
-            l1["a"] = 5;
-            l1["b"] = 3;
-            l1["x"] = 10;
-            l1["y"] = 20;
-            return py::eval(code.c_str(), py::globals(), l1); // 使用 eval 获取返回值
+          [code, locals]() -> py::object {
+            return py::eval(code.c_str(), py::globals(),
+                            locals); // 使用 eval 获取返回值
           });
 
       futures.push_back(task->get_future());
@@ -99,6 +79,76 @@ public:
     return results;
   }
 
+  // 批量提交优化版本
+  std::vector<std::string> submit_batch_optimized(
+      const std::vector<std::string> &expressions,
+      const std::unordered_map<std::string, int> &shared_locals) {
+    const size_t batch_size = expressions.size();
+    std::vector<std::future<std::string>> futures;
+    futures.reserve(batch_size);
+
+    // 1. 批量提交优化：单次锁保护整个任务提交
+    {
+      std::lock_guard<std::mutex> lock(queue_mutex_);
+      for (const auto &code : expressions) {
+        auto task = std::make_shared<std::packaged_task<std::string()>>(
+            [this, code, &shared_locals]() {
+              // 确保子解释器线程持有自己的GIL
+              py::gil_scoped_acquire acquire;
+              try {
+                // 在子解释器内创建局部变量
+                py::dict locals;
+                for (const auto &kv : shared_locals) {
+                  locals[kv.first.c_str()] = kv.second;
+                }
+
+                // 使用子解释器独立的全局上下文
+                py::object result = py::eval(code, py::globals(), locals);
+                return py::str(result).cast<std::string>();
+              } catch (py::error_already_set &e) {
+                // 保留异常信息并传递
+                return py::cast(e).cast<std::string>();
+              } catch (...) {
+                return py::cast(std::current_exception()).cast<std::string>();
+              }
+            });
+
+        futures.emplace_back(task->get_future());
+        task_queue_.push([task]() { (*task)(); });
+      }
+      // 单次通知所有工作线程
+      cv_.notify_all();
+    }
+
+    // 2. 异步结果收集
+    std::vector<std::string> results;
+    results.reserve(batch_size);
+
+    // 使用等待策略避免顺序阻塞
+    size_t completed = 0;
+    while (completed < batch_size) {
+      for (auto &future : futures) {
+        if (future.valid() && future.wait_for(std::chrono::seconds(0)) ==
+                                  std::future_status::ready) {
+          try {
+            // 主线程处理结果时需持有GIL
+            py::gil_scoped_acquire acquire;
+            std::string result = future.get();
+            results.emplace_back(std::move(result));
+          } catch (const std::exception &e) {
+            results.emplace_back(e.what());
+          }
+          completed++;
+          future = {}; // 标记为已处理
+        }
+      }
+      // 避免忙等待
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+
+    return results;
+  }
+
 private:
   void worker_thread(py::subinterpreter *sub) {
     while (true) {
@@ -113,7 +163,6 @@ private:
       }
 
       {
-        // py::gil_scoped_release release;
         py::subinterpreter_scoped_activate activate(*sub);
         try {
           task();
@@ -157,38 +206,27 @@ void test1(SubInterpreterPool &pool) {
 void test2(SubInterpreterPool &pool) {
 
   std::vector<std::string> tasks = {
-      "print('Task 1 in sub-interpreter')",
-      "print('Task 2 in sub-interpreter')",
-      "x = 100 + 200\nprint(f'x = {x}')",
-      "for i in range(3): print(f'Loop: {i}')",
-  };
-
-  std::cout << "Submitting batch..." << std::endl;
-  auto futures = pool.submit_batch(tasks);
-
-  std::cout << "Waiting for all tasks to complete..." << std::endl;
-  for (auto &f : futures) {
-    f.wait(); // 或者使用 f.get() 等待并捕获异常
-  }
-
-  std::cout << "All tasks completed." << std::endl;
-}
-
-void test3(SubInterpreterPool &pool) {
-
-  std::vector<std::string> tasks = {
       "2 + 3", "5 * 7", "sum([1, 2, 3])", "'hello' + 'world'", "a + b",
   };
 
   std::cout << "Submitting batch..." << std::endl;
-  auto results = pool.submit_batch2(tasks);
+
+  // 使用基本类型存储变量
+  std::unordered_map<std::string, int> shared_locals = {
+      {"a", 5},
+      {"b", 3},
+      {"x", 10},
+      {"y", 20},
+  };
+  // auto results = pool.submit_batch(tasks, l1);
+  auto results = pool.submit_batch_optimized(tasks, shared_locals);
 
   std::cout << "Waiting for results..." << std::endl;
   for (size_t i = 0; i < results.size(); ++i) {
     try {
-      py::object result = results[i];
-      std::string result_str = py::str(result).cast<std::string>();
-      std::cout << "Result[" << i << "] = " << result_str << std::endl;
+      std::string result = results[i];
+      // std::string result_str = py::str(result).cast<std::string>();
+      std::cout << "Result[" << i << "] = " << result << std::endl;
     } catch (const py::error_already_set &e) {
       std::cerr << "Python error in task " << i << ": " << e.what()
                 << std::endl;
@@ -205,8 +243,7 @@ int main() {
 
   SubInterpreterPool pool(4);
 
-  test1(pool);
+  // test1(pool);
   test2(pool);
-  test3(pool);
   return 0;
 }
