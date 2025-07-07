@@ -47,14 +47,20 @@ public:
   }
 
   // 分批提交 Python 表达式，并返回每个表达式的结果 future 列表
-  std::vector<py::object>
-  submit_batch(const std::vector<std::string> &expressions, py::dict locals) {
+  std::vector<std::string>
+  submit_batch(const std::vector<std::string> &expressions,
+               const std::unordered_map<std::string, int> shared_locals) {
 
-    std::vector<std::future<py::object>> futures;
+    std::vector<std::future<std::string>> futures;
 
     for (const auto &code : expressions) {
-      auto task = std::make_shared<std::packaged_task<py::object()>>(
-          [code, locals]() -> py::object {
+      auto task = std::make_shared<std::packaged_task<std::string()>>(
+          [code, shared_locals]() {
+            // 在子解释器内创建局部变量
+            py::dict locals;
+            for (const auto &kv : shared_locals) {
+              locals[kv.first.c_str()] = kv.second;
+            }
             return py::eval(code.c_str(), py::globals(),
                             locals); // 使用 eval 获取返回值
           });
@@ -63,17 +69,18 @@ public:
       submit([task]() { (*task)(); });
     }
 
-    std::vector<py::object> results;
+    std::vector<std::string> results;
     for (auto &future : futures) {
       try {
         py::gil_scoped_acquire acquire;
-        results.push_back(future.get());
+        std::string result = future.get();
+        results.push_back(result);
       } catch (const std::future_error &e) {
         std::cerr << "Future error: " << e.what() << std::endl;
-        results.push_back(py::none());
+        // results.push_back(py::str());
       } catch (const py::error_already_set &e) {
         std::cerr << "Python error: " << e.what() << std::endl;
-        results.push_back(py::none());
+        // results.push_back(py::str());
       }
     }
     return results;
@@ -82,7 +89,7 @@ public:
   // 批量提交优化版本
   std::vector<std::string> submit_batch_optimized(
       const std::vector<std::string> &expressions,
-      const std::unordered_map<std::string, int> &shared_locals) {
+      const std::unordered_map<std::string, int> shared_locals) {
     const size_t batch_size = expressions.size();
     std::vector<std::future<std::string>> futures;
     futures.reserve(batch_size);
@@ -92,7 +99,7 @@ public:
       std::lock_guard<std::mutex> lock(queue_mutex_);
       for (const auto &code : expressions) {
         auto task = std::make_shared<std::packaged_task<std::string()>>(
-            [this, code, &shared_locals]() {
+            [this, code, shared_locals]() {
               // 确保子解释器线程持有自己的GIL
               py::gil_scoped_acquire acquire;
               try {
@@ -218,8 +225,8 @@ void test2(SubInterpreterPool &pool) {
       {"x", 10},
       {"y", 20},
   };
-  // auto results = pool.submit_batch(tasks, l1);
-  auto results = pool.submit_batch_optimized(tasks, shared_locals);
+  auto results = pool.submit_batch(tasks, shared_locals);
+  // auto results = pool.submit_batch_optimized(tasks, shared_locals);
 
   std::cout << "Waiting for results..." << std::endl;
   for (size_t i = 0; i < results.size(); ++i) {
